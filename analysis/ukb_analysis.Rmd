@@ -1,0 +1,642 @@
+---
+title: "Analysis of the UK Biobank significance results"
+date: "08/11/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(patchwork)
+library(qqman)
+QQ_setup <-
+  function(p) {
+    df <- data.frame(observed = -log10(sort(p)),
+                     theoretical = -log10(1:length(p) / (length(p) + 1)))
+}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load UKB results
+
+```{r}
+setwd("./data/ukb_lit/")
+fnames <- list.files("./", include.dirs = F)
+df <- NULL
+i <- 1
+for (f in fnames) {
+  load(paste0("./", f))
+  df <- dplyr::bind_rows(df, out)
+}
+
+dim(df)
+head(df)
+```
+
+Drop SNPs with poor imputation quality ($<0.9$).
+
+```{r}
+setwd("./data/INFO_scores/")
+fnames <- list.files("./", include.dirs = F)
+
+info_scores <- NULL
+for (f in fnames) {
+  tmp <- read_tsv(f, col_names = FALSE)[, c(2:6, 8)]
+  colnames(tmp) <- c("id", "pos", "alt", "ref", "maf_full", "info")
+  tmp <- tmp %>% filter(maf_full > 0.01)
+  info_scores <- dplyr::bind_rows(info_scores, tmp)
+}
+
+df_info <- df %>%
+  left_join(info_scores %>% dplyr::select(-maf_full), by = c("id", "pos", "alt", "ref"))
+
+dfs <- df_info %>% filter(info > 0.9)
+
+setwd("../../")
+saveRDS(dfs, file = "./data/imputed_results.rds")
+```
+
+# Genomic inflation factor
+
+```{r}
+# Filter LD regions
+df_ld <- list()
+for (i in 1:22) {
+  tmp <- read_tsv(paste0("~/Dropbox/postdoc/ajbass/tint/scripts/UKBiobank/obesity/LD_prune_snps/chr_", i, "_prune.prune.in"), col_names = FALSE)$X1
+  tmp0 <- dfs %>% filter(id %in% tmp)
+  df_ld <- rbind(df_ld, tmp0)
+}
+
+df_ld_collapse <- df_ld %>% gather(method, pval, lit_ev:lit)
+
+gif <- df_ld_collapse %>%
+  group_by(method) %>% filter(pval > 5e-8) %>%
+  mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+  mutate(lambda_chisq =  median(chisq) / qchisq(.5, 1)) %>%
+  mutate(p.adjusted = pchisq(qchisq(pval, 1, lower.tail = FALSE) / lambda_chisq, df = 1, lower.tail = FALSE))
+
+# CCT of adjusted p-values
+gif2 <- gif %>% filter(method != "lit")
+gif_lit <- gif2 %>%
+  filter(id %in% df_ld$id[df_ld$lit > 5e-8]) %>%
+  group_by(chr, id, pos, alt, ref, maf, info) %>%
+  summarise(method = "lit", p.adjusted = ACAT::ACAT(p.adjusted))
+
+gif_lit <- gif_lit %>%
+  left_join(df_ld %>% select(chr, id, pos, alt, ref, maf, lit)) %>%
+  rename(pval = lit)
+
+gif <- rbind(gif2, gif_lit)
+
+write_tsv(gif %>% filter(method != "lit") %>% dplyr::select(method, lambda_chisq) %>% distinct(),
+          file = "./data/gif_values.tsv")
+
+gif$method <- factor(gif$method, labels =  c("aLIT", "uLIT", "wLIT"))
+cbbPalette <- c( "black", "#0072B2","#009E73")
+gif_plot <- gif  %>%
+  group_by(method) %>%
+  do(QQ_setup(.$pval)) %>%
+  ggplot(aes(x = theoretical, y = observed, color = method)) +
+  geom_point( size = 1, alpha = 0.6) +
+  geom_abline(slope = 1)  + 
+  scale_color_manual(values = cbbPalette, name = "Method") +
+    theme_bw(base_size = 12) +
+  xlab(expression(-log[10](theoretical)))+
+  ylab(expression(-log[10](observed)))+
+  ggtitle("Unadjusted") + 
+  theme(strip.background = element_rect(fill = NA, color = "black"), axis.line = element_line(color='black'),plot.title = element_text(hjust = 0.5),
+        plot.background = element_blank(),
+        panel.grid.minor = element_blank())
+
+# GIF adjusted p-values
+gif_plot2 <- gif  %>%
+  group_by(method) %>%
+  do(QQ_setup(.$p.adjusted)) %>%
+  ggplot(aes(x = theoretical, y = observed, color = method)) +
+  geom_point( size = 1, alpha =0.6) +
+  geom_abline(slope = 1)  + 
+  scale_color_manual(values = cbbPalette, name = "Method") +
+    theme_bw(base_size = 12) +
+  xlab(expression(-log[10](theoretical)))+
+  ylab(expression(-log[10](observed)))+
+  ggtitle("Adjusted") + 
+  theme(strip.background = element_rect(fill = NA, color = "black"), axis.line = element_line(color='black'),plot.title = element_text(hjust = 0.5),
+        plot.background = element_blank(),
+        panel.grid.minor = element_blank())
+
+p <- (gif_plot + gif_plot2 +  plot_layout(guides = 'collect'))+ plot_annotation(tag_levels = 'a',tag_prefix = '(', tag_suffix = ')')
+
+ggsave(p,
+       width = 9,
+       height = 4,
+       filename = "./figures/imputed-ukb-qqplot-gif.png")
+
+# GIF as a function of MAF
+p1 <- gif %>% 
+    mutate(maf = ifelse(maf > 0.5, 1 - maf,maf)) %>%
+    mutate(grp =  findInterval(maf, quantile(maf, probs = seq(0, 1, by = 0.2)), all.inside = TRUE)) %>%
+    group_by(method, grp) %>%
+    mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+    summarise(lambda_chisq = median(chisq) / qchisq(.5, 1)) %>%
+    ggplot(aes(x = as.character(grp), y = lambda_chisq, color = method)) + geom_line() + geom_point() + geom_line(aes(x  = grp, y = lambda_chisq,color = method)) + xlab("MAF quantiles") + ylab("GIF") +
+    scale_color_manual(values = cbbPalette, name = "Method") +
+    theme_bw() + scale_x_discrete(labels=c("1" = "(0, 0.2]", "2" = "(0.2, 0.4]", "3"= "(0.4, 0.6]", "4"= "(0.6, 0.8]", "5" = "(0.8, 1]"))
+
+ggsave(p1,
+       width = 5,
+       height = 3,
+       filename ="./figures/imputed-ukb-qqplot-gif-maf.png")
+```
+
+# aLIT of adjusted p-values
+
+```{r}
+# CCT the adjusted p-values
+gif <- df_ld_collapse %>%
+  group_by(method) %>%
+  filter(pval > 5e-8) %>%
+  mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+  summarise(lambda_chisq =  median(chisq) / qchisq(.5, 1)) 
+
+dfs_tmp <- dfs %>% 
+  gather(method, pval, lit_ev:lit_eq_ev) %>%
+  left_join(gif)
+
+# aLIT adjusted p-values
+dfs_CCT <- dfs_tmp %>% 
+  group_by(method, lambda_chisq) %>%
+  mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+  mutate(p.adjusted = pchisq(qchisq(pval, 1, lower.tail = FALSE) / lambda_chisq,
+                             df = 1, lower.tail = FALSE)) %>% 
+  ungroup() %>%
+  group_by(chr, id, pos, alt, ref, maf, info) %>%
+  summarise(cauchy.adjusted = ACAT::ACAT(p.adjusted))
+
+saveRDS(dfs_CCT,
+        file = "./data/imputed_results_cauchy_adjusted.rds")
+
+# Change names for LocusZoom
+tmp <- dfs_CCT %>%
+  dplyr::select(chr, pos, id, alt, ref, cauchy.adjusted) %>%
+  dplyr::rename(rsid = id) %>%
+  dplyr::rename(p = cauchy.adjusted)
+dfs_locus_zoom <- tmp %>%
+  group_by(chr) %>%
+  arrange(pos) %>% ungroup() %>%
+  arrange(chr)
+
+write_tsv(dfs_locus_zoom, file = "./data/significance_int.tsv")
+```
+
+## Manhattan plot of aLIT p-values
+
+```{r}
+# load data
+df_CCT <- readRDS("./data/imputed_results_cauchy_adjusted.rds")
+
+## Manhattan line
+snpsOfInterest <- df_CCT$id[df_CCT$cauchy.adjusted < 5e-8]
+tmp <- df_CCT %>% ungroup() %>%
+  mutate(chr = as.numeric(chr)) %>%
+  filter(cauchy.adjusted < 0.01)
+png("./figures/imputed_manhattan_plot_cauchy.png", width = 9, units = "in", height = 5, res = 1250)
+manhattan(tmp, snp = "id", p = "cauchy.adjusted", chr = "chr", bp = "pos", ylab = expression(-log[10]("p-value")), suggestiveline = FALSE,  annotateTop = FALSE, chrlabs = as.character(1:22), col = c( "#000000",  "#0072B2"), ylim = c(0,50))
+dev.off()
+
+# total discoveries
+sig <- df_CCT %>% filter(cauchy.adjusted < 5e-8)
+dim(sig)
+```
+
+## Table of results (LocusZoom)
+
+```{r}
+# Lead SNPs from LocusZoom
+df <- data.frame(chr = as.character(c(5, 12, 6, 11,
+                                      7, 1, 18, 6, 
+                                      1, 2, 16)),
+                 pos = c(55796639, 50263148, 34724815, 27618490, 
+                         130466966, 203518178, 57832856,27205422, 
+                         219741820, 165501927, 53802494),
+                 Gene = c("MAP3K1", "FAIM2", "ILRUN", "LIN7C", 
+                          "KLF14", "ATP2B4", "MC4R", "PRSS16", 
+                          "LYPLAL1", "COBLL1",  "FTO"))
+
+tbl <- dfs_CCT %>%
+  right_join(df) %>%
+  dplyr::select(chr, Gene,  id, maf, cauchy.adjusted) %>%
+  distinct()
+
+# Lead SNPs for plink to get LD region 
+for (i in unique(tbl$chr)) {
+  write_tsv(tbl %>% ungroup() %>% filter(chr == i) %>% dplyr::select(id), col_names = FALSE, file = paste0("./data/lead_snps/lead_snps", i, ".tsv"))
+}
+
+# All significant SNPs for dominance testing
+sig <- dfs_CCT %>% filter(cauchy.adjusted < 5e-8)
+for (i in unique(sig$chr)) {
+  write_tsv(sig %>% ungroup() %>% filter(chr == i) %>% select(id), col_names = FALSE, file = paste0("./data/significant_snps/significant_snps", i, ".tsv"))
+}
+```
+
+## Remove dominance
+
+```{r}
+# Get phenotype and covariates
+adjustment <- read_tsv("./data/obesity_covariates.tab")
+phenotype <- read_tsv("./data/obesity_phenotypes.tab")
+fam_file <- genio::read_fam(file = "/Users/ajbass/UKB_data/imputed_genotypes/chunks/c22/chr_22_p1")
+
+# Make sure order in file is the same as bed file (should be)
+tmp <- data.frame(IID = as.numeric(fam_file$id))
+phenotype <- tmp %>% left_join(phenotype)
+adjustment <- tmp %>% left_join(adjustment)
+adjustment <- as.matrix(adjustment[, 3:24])
+phenotype <- as.matrix(phenotype[, -c(1)])
+PC <- svd(as.matrix(adjustment[, 3:22]))$u
+rm(tmp, fam_file)
+
+run_h_speed <- function(chr) {
+  path <- paste0("./data/significant_snps/significant_snp_", chr)
+  # Load set of SNPs in LD
+  snp.list <- read_tsv(paste0(path,".bim"), col_names = F)$X2
+  genotypes <- snpStats::read.plink(paste0(path, ".bed"), paste0(path, ".bim"), paste0(path, ".fam"), )
+  X <- as(t(genotypes$genotypes), "numeric")
+ 
+  out <- lit::lit_h(y = phenotype,
+                    x = as.matrix(t(X)),
+                    pop_struct = PC)
+  out$id <- snp.list
+  saveRDS(out, file = paste0("./data/significant_snps/dominance-test/", chr, ".rds"))
+  return(NULL)
+}
+
+# For chr 17 (too large to load directly into R)
+run_h <- function(chr) {
+  path <- paste0("./data/significant_snps/significant_snp_", chr)
+  # Load set of SNPs in LD
+  snp.list <- read_tsv(paste0(path,".bim"), col_names = F)$X2
+  out <- NULL
+  for (snp in snp.list) {
+    genotypes <- snpStats::read.plink(paste0(path, ".bed"), paste0(path, ".bim"), paste0(path, ".fam"), select.snps = snp)
+    X <- as(t(genotypes$genotypes), "numeric")
+ 
+    tmp <- lit::lit_h(y = phenotype,
+                      x = as.matrix(t(X)),
+                      pop_struct = PC)
+    out <- rbind(tmp, out)
+  }
+  out$id <- snp.list
+  saveRDS(out, file =paste0("./data/significant_snps/dominance-test/", chr, ".rds"))
+  return(NULL)
+}
+
+for (chr in unique(sig$chr)[-8]) {
+  run_h_speed(chr = chr)
+}
+
+# chr 6 is large, separate function
+run_h(chr = 6)
+
+# Load results from above
+dom <- NULL
+for (chr in unique(sig$chr)) {
+  tmp <- readRDS(paste0("./data/significant_snps/dominance-test/", chr, ".rds"))
+  dom <- rbind(dom, tmp)
+}
+
+# adjust p-values using estimate GIF from above
+GIF <- data.frame(method = c("lit_ev", "lit_eq_ev"),
+                  GIF = c(1.1445218237804937, 1.1426029110057698))
+
+out_overlap <- dom[, -3, drop = F]  %>%
+    left_join(dfs_CCT) %>%
+  filter(cauchy.adjusted < 5e-8) %>%
+    gather(method, p.value, lit_ev:lit_eq_ev) %>%
+  left_join(GIF) %>% 
+   mutate(p.adjusted = pchisq(qchisq(p.value, 1, lower.tail = FALSE) / GIF, df = 1, lower.tail = FALSE)) %>% 
+  ungroup() %>%
+  group_by(id, chr, cauchy.adjusted) %>%
+  summarise(cauchy.adjusted.2df = ACAT::ACAT(p.adjusted))
+
+p <- out_overlap %>% mutate(chr = as.numeric(chr)) %>%
+  arrange(chr) %>% 
+    ggplot(aes(x = -1*log10(cauchy.adjusted.2df), y = -1*log10(cauchy.adjusted), color = as.factor(cauchy.adjusted.2df > 5e-8))) +
+    geom_point(size =0.75, alpha = 0.5) + theme_bw() + geom_abline(intercept = 0,slope = 1, linetype ="dashed") + theme(legend.position = "none") + scale_color_manual(values = c("#999999", "darkred")) + ylab("aLIT (additive)") + xlab("aLIT (dominance)") + coord_fixed()
+
+# create plot comparing with original significant results
+ggsave(p,
+       width = 5,
+       height = 3,
+       filename = "./figures/dominance.png")
+```
+
+## Adjusting for SNPs in LD
+
+```{r}
+# Get phenotype and covariates
+adjustment <- read_tsv("./data/obesity_covariates.tab")
+phenotype <- read_tsv("./data/obesity_phenotypes.tab")
+fam_file <- genio::read_fam(file = "/Users/ajbass/UKB_data/imputed_genotypes/chunks/c22/chr_22_p1")
+
+# Make sure order in file is the same as bed file (should be)
+tmp <- data.frame(IID = as.numeric(fam_file$id))
+phenotype <- tmp %>% left_join(phenotype)
+adjustment <- tmp %>% left_join(adjustment)
+adjustment <- as.matrix(adjustment[, 3:24])
+phenotype <- as.matrix(phenotype[, -c(1)])
+PC <- svd(as.matrix(adjustment[, 3:22]))$u
+rm(tmp, fam_file)
+
+run_sims <- function(chr, key.snp, snp.id) {
+  path <- paste0("./data/LD/LD_", chr)
+  # Load set of SNPs in LD
+  genotypes <- snpStats::read.plink(paste0(path, ".bed"), paste0(path, ".bim"), paste0(path, ".fam"))
+  X <- as(t(genotypes$genotypes), "numeric")
+  ID_NAMES <- rownames(X)
+  kX <- X[ID_NAMES == key.snp,]
+  # Filter NAs from key SNP
+  sid <- is.na(kX)
+  kX <- kX[!sid]
+  ID <- ID_NAMES %in% snp.id[-length(snp.id)]
+  X <- X[ID,,drop = FALSE]
+  phenotype_filt <- phenotype[!sid,]
+  # Mean-center any missing NAs from other SNPs 
+  X <- X[, !sid,drop = FALSE]
+  NA_IND <- is.na(X) # index the missing values
+  mean_X <- rowMeans(X, na.rm=TRUE)
+  norm_X <- X - mean_X # center
+  norm_X[NA_IND] <- 0 # then 'impute'
+  mysvd <- svd(t(norm_X))
+  svalues <- mysvd$d
+  # Use the PCs to regress out
+  U <- t(t(mysvd$u[, svalues^2 > 1e-4]) * svalues[svalues^2 > 1e-4])
+  lmfit <- lm(phenotype_filt ~ U)
+  fit <- fitted(lmfit)
+  phenotype_res <- residuals(lmfit)
+  out <- lit::lit(y = phenotype_res,
+                  x = as.matrix(kX),
+                  pop_struct = PC[!sid,])
+  return(out)
+}
+```
+
+```{r}
+gamut <- readRDS("./data/gamut.rds")
+ld_res <- gamut %>% left_join(sig)
+
+fnames <- paste0("LDregion_", c(1, 2, 3, 5, 6, 7, 11, 12, 16, 18), ".ld")
+snp.list <- NULL
+ndf <- NULL
+for (f in fnames) {
+  tt <- readr::read_table(paste0("./data/LD/", f), col_names = TRUE)
+  tt$id <- tt$SNP_B
+  tmp <- tt %>% left_join(ld_res)
+  tmp <- tmp %>% filter(cauchy < 5e-8)
+  key.snp <- unique(tmp$SNP_A)
+  
+  out <- tot <- NULL
+  for (i in key.snp) {
+    tmp_filt <- tmp %>% filter(SNP_A == i)
+    if (length(c(unique(tmp_filt$SNP_B), i)) != 1){
+    p <- run_sims(chr = unique(tmp_filt$CHR_A), key.snp = i, snp.id = c(unique(tmp_filt$SNP_B), i))
+    out = c(out, as.numeric(p))
+    tot = c(length(unique(tmp_filt$SNP_B)), tot)
+    }
+  }
+  qq <- data.frame(snp = rep(key.snp, each = 3), chr = unique(tmp_filt$CHR_A), p.value = out, tot =rep(tot,each = 3))
+  ndf <- rbind(ndf, qq)
+  write_tsv(qq, file = paste0("./data/LD/updated_sig_results_LD.",f))
+}
+
+# Load results from above 
+ld <- NULL
+for (f in fnames) {
+  tmp <- read_tsv(paste0("./data/LD/updated_sig_results_LD.", f))
+  ld <- rbind(ld, tmp)
+}
+
+ld$method <- rep( c("lit_ev", "lit_eq_ev", "lit"), nrow(ld) / 3)
+GIF <- data.frame(method = c("lit_ev", "lit_eq_ev"),
+                  GIF = c(1.1445218237804937, 1.1426029110057698))
+
+ld <- ld %>%
+  filter(method != "lit") %>%
+  mutate(chr = as.character(chr)) %>%
+  left_join(GIF) %>%
+  mutate(p.adjusted = pchisq(qchisq(p.value, 1, lower.tail = FALSE) / GIF, df = 1, lower.tail = FALSE)) %>% 
+  ungroup() %>%
+  group_by(snp,chr,tot) %>%
+  summarise(cauchy.adjusted.ld = ACAT::ACAT(p.adjusted))
+write_tsv(ld, file = paste0("./data/updated_sig_results_LD.tsv"))
+```
+
+## Marginal UKB
+
+```{r}
+setwd("./data/ukb_marginal/")
+fnames <- list.files("./", include.dirs = F)
+df <- NULL
+i <- 1
+for (f in fnames) {
+  load(paste0("./", f))
+  df <- dplyr::bind_rows(df, out)
+}
+t <- c("BMI", "WC", "HC", "BFP")
+cpterms <- outer(t, t, FUN = function(x,y) paste0(x,"_", y))
+tmp <- upper.tri(cpterms)
+cpterms <- c(cpterms[tmp], diag(cpterms))
+colnames(df)[7:16] <- cpterms
+
+setwd("./data/INFO_scores/")
+fnames <- list.files("./", include.dirs = F)
+
+info_scores <- NULL
+i <- 1
+for(f in fnames) {
+  tmp <- read_tsv(f, col_names = FALSE)[, c(2:6, 8)] 
+  colnames(tmp) <- c("id", "pos", "alt", "ref", "maf_full", "info")
+  tmp <- tmp %>% filter(maf_full > 0.01)
+  info_scores <- dplyr::bind_rows(info_scores, tmp)
+}
+
+df_info <- df %>%
+  left_join(info_scores %>% select(-maf_full), by = c("id", "pos", "alt", "ref"))
+
+dfs <- df_info %>% filter(info > 0.9)
+
+# Filter LD regions to get GIF
+df_ld <- list()
+for (i in 1:22) {
+  tmp <- read_tsv(paste0("~/Dropbox/postdoc/ajbass/tint/scripts/UKBiobank/obesity/LD_prune_snps/chr_", i, "_prune.prune.in"), col_names = FALSE)$X1
+  tmp0 <- dfs %>% filter(id %in% tmp)
+  df_ld <- rbind(df_ld, tmp0)
+}
+
+#####
+# Marginal (SQ/CP)
+df_ld_collapse <- df_ld %>% mutate(id2 = 1:nrow(df_ld)) %>%
+    gather(method, pval, BMI_WC:BFP_BFP)
+
+gif <- df_ld_collapse %>% group_by(method) %>% filter(pval > 5e-8) %>%
+  mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+  summarise(lambda_chisq =  median(chisq) / qchisq(.5, 1))
+
+df_ld_collapse2 <- dfs %>%
+  mutate(id2 = 1:nrow(dfs)) %>%
+    gather(method, pval, BMI_WC:BFP_BFP) %>% left_join(gif)
+gif <- df_ld_collapse2 %>% 
+  group_by(method, lambda_chisq) %>%
+  mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+  mutate(p.adjusted = pchisq(qchisq(pval, 1, lower.tail = FALSE) / lambda_chisq, df = 1, lower.tail = FALSE))
+#####
+
+##### 
+# Marginal_SQ
+df_ld_collapse2 <- df_ld %>% mutate(id2 = 1:nrow(df_ld)) %>%
+    gather(method, pval, BMI_BMI:BFP_BFP)
+
+gif2 <- df_ld_collapse2 %>% group_by(method) %>% filter(pval > 5e-8) %>%
+  mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+  summarise(lambda_chisq =  median(chisq) / qchisq(.5, 1))
+
+df_ld_collapse22 <- dfs %>% mutate(id2 = 1:nrow(dfs)) %>%
+    gather(method, pval, BMI_BMI:BFP_BFP) %>% left_join(gif2)
+gif2 <- df_ld_collapse22 %>% 
+  group_by(method, lambda_chisq) %>%
+  mutate(chisq = qchisq(pval, 1, lower.tail = FALSE)) %>%
+  mutate(p.adjusted = pchisq(qchisq(pval, 1, lower.tail = FALSE) / lambda_chisq, df = 1, lower.tail = FALSE))
+#########
+
+# load phenotypes to estimate correction factor
+phenotypes <- read_tsv("./data/obesity_phenotypes.tab")
+
+svalues <- svd(scale(cbind(phenotypes[,-1])))$d
+lambda <- svalues ^ 2 / sum(svalues ^ 2)
+K0 <- sum(cumsum(lambda) < 0.95) + 1
+
+svalues <- svd(scale(cbind(phenotypes[,-1], lit::.pairwise_prod(as.matrix(phenotypes[,-1])))))$d
+lambda <- svalues ^ 2 / sum(svalues ^ 2)
+K <- sum(cumsum(lambda) < 0.95) + 1
+
+# Bonferroni of the adjusted p-values Marginal (SQ/CP)
+gif <- gif %>% 
+  ungroup() %>%
+  group_by(chr, id2, pos, alt, ref, maf, info) %>%
+  summarise(bonf.p.value = pmin(min(p.adjusted) * K, 1))
+
+saveRDS(gif,
+        file = "./data/imputed_results_marginal_adjusted.rds")
+
+# Bonferroni of the adjusted p-values Marginal (SQ)
+gif2 <- gif2 %>% 
+  ungroup() %>%
+  group_by(chr, id2, pos, alt, ref, maf, info) %>%
+  summarise(bonf.p.value = pmin(min(p.adjusted) * K0, 1))
+
+saveRDS(gif2,
+        file = "./data/imputed_results_marginal_sq_adjusted.rds")
+
+# Compare Marginal (SQ/CP) to aLIT
+int_results <- readRDS("./data/imputed_results_cauchy_adjusted.rds")
+
+tmp <- gif %>% left_join(int_results)
+
+plot_dat <- tmp %>% ungroup() %>% filter(cauchy.adjusted < 5e-8 | bonf.p.value < 5e-8)
+plot_dat <- plot_dat %>% mutate( Group = ifelse((cauchy.adjusted < 5e-8) * (bonf.p.value < 5e-8), "Both",
+                                                ifelse((bonf.p.value < 5e-8), "Marginal only",
+                                                ifelse((cauchy.adjusted < 5e-8), "aLIT only", "NONE"))))
+
+saveRDS(plot_dat, file = "./data/lit_vs_marginal.rds")
+
+cbbPalette <- c("#000000", "#009E73", "#0072B2", "#D55E00", "#CC79A7")
+p1 <- plot_dat %>%
+  ggplot(aes(x = -log10(bonf.p.value) , y = -log10(cauchy.adjusted), color = Group)) + geom_point(alpha = 0.5, size = 1.0)+
+  geom_abline(slope = 1)  +
+    theme_bw(base_size = 12) +
+   xlab(expression("Marginal"~(-log[10]("p-value")))) +
+  ylab(expression("aLIT"~(-log[10]("p-value")))) +   scale_color_manual(values = cbbPalette, name = "Discoveries")  +
+  theme(strip.background = element_rect(fill = NA, color = "black"), axis.line = element_line(color='black'),plot.title = element_text(hjust = 0.5),
+        plot.background = element_blank(),
+        panel.grid.minor = element_blank())
+table(plot_dat$Group)
+
+ggsave(p1, 
+       width = 5,
+       height = 3,
+       filename = "./figures/imputed-ukb-marginal-INT.png")
+
+p11 <- plot_dat %>% mutate(chr = as.numeric(chr)) %>% arrange(as.numeric(chr)) %>%
+    ggplot(aes(x = -log10(bonf.p.value) , y = -log10(cauchy.adjusted), color = Group)) + geom_point(alpha = 0.5, size = 1.0)+
+    geom_abline(slope = 1)  +
+    theme_bw(base_size = 12) +
+    xlab(expression("Marginal"~(-log[10]("p-value")))) +
+    ylab(expression("aLIT"~(-log[10]("p-value")))) +   scale_color_manual(values = cbbPalette, name = "Discoveries")  +
+    theme(strip.background = element_rect(fill = NA, color = "black"), axis.line = element_line(color='black'),plot.title = element_text(hjust = 0.5),
+          plot.background = element_blank(),
+          panel.grid.minor = element_blank()) + facet_wrap(~chr)
+
+ggsave(p11, 
+       width = 8,
+       height = 6,
+       filename = "./figures/imputed-ukb-marginal-INT-chr.png")
+```
+
+## Genotype x Sex interaction test
+
+```{r}
+# Get phenotype and covariates
+adjustment <- read_tsv("./data/obesity_covariates.tab")
+phenotype <- read_tsv("./data/obesity_phenotypes.tab")
+fam_file <- genio::read_fam(file = "/Users/ajbass/UKB_data/imputed_genotypes/chunks/c22/chr_22_p1")
+
+# Make sure order in file is the same as bed file (should be)
+tmp <- data.frame(IID = as.numeric(fam_file$id))
+phenotype <- tmp %>% left_join(phenotype)
+adjustment <- tmp %>% left_join(adjustment)
+adjustment <- as.matrix(adjustment[, 3:24])
+sex <- as.matrix(adjustment[, 2, drop = FALSE])
+phenotype <- as.matrix(phenotype[, -c(1)])
+PC <- svd(as.matrix(adjustment[, 3:22]))$u
+rm(tmp, fam_file)
+
+run_sims <- function(chr, key.snp, snp.id) {
+  path <- paste0("./data/LD/LD_", chr)
+  # Load set of SNPs in LD
+  genotypes <- snpStats::read.plink(paste0(path, ".bed"), paste0(path, ".bim"), paste0(path, ".fam"))
+  X <- as(t(genotypes$genotypes), "numeric")
+  ID_NAMES <- rownames(X)
+  kX <- X[ID_NAMES == key.snp,]
+  # Filter NAs from key SNP
+  sid <- is.na(kX)
+  kX <- kX[!sid]
+  ID <- ID_NAMES %in% snp.id[-length(snp.id)]
+  phenotype_filt <- phenotype[!sid,]
+  PC_filt <- PC[!sid,]
+  sex0 = scale(sex[!sid])
+  # remove structure/additive effect
+  lmfit <- lm(phenotype_filt ~ PC_filt + kX)
+  phenotype_res <- residuals(lmfit)
+  # remove structure from genotypes (mean effects)
+  geno <- scale(lit:::.quick_lm_cpp(Y = as.matrix(kX), X = cbind(1, PC_filt)))
+  # test interactive effect
+  out = broom::tidy(anova(lm(phenotype_res ~ PC_filt + sex0*geno)))$p.value[5]
+  df = data.frame(chr = chr, snp = key.snp, approach = c("sex"), p = out)
+  return(df)
+}
+```
+
+```{r}
+fnames <- paste0("LDregion_", c(1, 2, 3, 5, 6, 7, 11, 12, 16, 18), ".ld")
+snp.list <- ndf <- NULL
+for (f in fnames) {
+  tt <- readr::read_table(paste0("./data/LD/", f), col_names = TRUE)
+  key.snp <- unique(tt$SNP_A)
+  out <- tot <- NULL
+  for (i in key.snp) {
+    p <- run_sims(chr = unique(tt$CHR_A), key.snp = i, snp.id = i)
+    ndf <- rbind(ndf, p)
+    }
+}
+write_tsv(ndf, file = paste0("./data/updated_sig_results_INTERACTION_raw.tsv"))
+```
